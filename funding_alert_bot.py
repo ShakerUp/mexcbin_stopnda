@@ -90,6 +90,7 @@ class ScanStats:
     common_tokens: int = 0
     mexc_interval_missing: int = 0
     interval_mismatches: int = 0
+    filtered_low_funding: int = 0
     alert_candidates: int = 0
     alerts_sent: int = 0
     skipped_by_cooldown: int = 0
@@ -151,6 +152,7 @@ def load_config() -> BotConfig:
             common_tokens=int(last_raw.get("common_tokens", 0)),
             mexc_interval_missing=int(last_raw.get("mexc_interval_missing", 0)),
             interval_mismatches=int(last_raw.get("interval_mismatches", 0)),
+            filtered_low_funding=int(last_raw.get("filtered_low_funding", 0)),
             alert_candidates=int(last_raw.get("alert_candidates", 0)),
             alerts_sent=int(last_raw.get("alerts_sent", 0)),
             skipped_by_cooldown=int(last_raw.get("skipped_by_cooldown", 0)),
@@ -182,6 +184,7 @@ def save_config() -> None:
             "common_tokens": config.last_scan.common_tokens,
             "mexc_interval_missing": config.last_scan.mexc_interval_missing,
             "interval_mismatches": config.last_scan.interval_mismatches,
+            "filtered_low_funding": config.last_scan.filtered_low_funding,
             "alert_candidates": config.last_scan.alert_candidates,
             "alerts_sent": config.last_scan.alerts_sent,
             "skipped_by_cooldown": config.last_scan.skipped_by_cooldown,
@@ -641,6 +644,8 @@ async def scan() -> tuple[
     dict[str, FundingInfo],
     list[str],
     list[IntervalMismatch],
+    int,
+    int,
 ]:
     headers = {"User-Agent": "funding-interval-bot-current-intervals-v1"}
     connector = make_connector()
@@ -661,6 +666,8 @@ async def scan() -> tuple[
 
     mismatches: list[IntervalMismatch] = []
     missing_mexc_intervals = 0
+    raw_interval_mismatches = 0
+    filtered_low_funding = 0
 
     for symbol in common:
         if symbol in config.blacklist:
@@ -676,25 +683,32 @@ async def scan() -> tuple[
         if b.interval_hours is None:
             continue
 
-        # Skip dead/near-zero funding pairs.
-        # At least one side must have abs funding >= MIN_FUNDING_RATE.
-        b_abs = abs(b.rate) if b.rate is not None else Decimal("0")
-        m_abs = abs(m.rate) if m.rate is not None else Decimal("0")
-
-        if max(b_abs, m_abs) < MIN_FUNDING_RATE:
-            continue
-
         if b.interval_hours != m.interval_hours:
+            raw_interval_mismatches += 1
+
+            # Skip dead/near-zero funding pairs.
+            # At least one side must have abs funding >= MIN_FUNDING_RATE.
+            b_abs = abs(b.rate) if b.rate is not None else Decimal("0")
+            m_abs = abs(m.rate) if m.rate is not None else Decimal("0")
+            max_funding = max(b_abs, m_abs)
+
+            if max_funding < MIN_FUNDING_RATE:
+                filtered_low_funding += 1
+                continue
+
             mismatches.append(IntervalMismatch(symbol=symbol, binance=b, mexc=m))
 
     logger.info(
-        "SCAN | Binance tokens=%s | MEXC tokens=%s | common=%s | interval mismatches=%s | MEXC interval missing=%s | blacklist=%s",
+        "SCAN | Binance tokens=%s | MEXC tokens=%s | common=%s | raw mismatches=%s | filtered low funding=%s | alert candidates=%s | MEXC interval missing=%s | blacklist=%s | min funding=%s%%",
         len(binance),
         len(mexc),
         len(common),
+        raw_interval_mismatches,
+        filtered_low_funding,
         len(mismatches),
         missing_mexc_intervals,
         len(config.blacklist),
+        f"{MIN_FUNDING_RATE * Decimal('100'):.4f}",
     )
 
     if common:
@@ -729,7 +743,7 @@ async def scan() -> tuple[
             ),
         )
 
-    return binance, mexc, common, mismatches
+    return binance, mexc, common, mismatches, raw_interval_mismatches, filtered_low_funding
 
 
 def render_alert(item: IntervalMismatch) -> str:
@@ -761,7 +775,7 @@ async def send_alert(context: ContextTypes.DEFAULT_TYPE, item: IntervalMismatch)
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        binance, mexc, common, mismatches = await scan()
+        binance, mexc, common, mismatches, raw_interval_mismatches, filtered_low_funding = await scan()
     except Exception as exc:
         logger.exception("Check failed: %s", exc)
         config.last_scan = ScanStats(
@@ -792,7 +806,8 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         mexc_tokens=len(mexc),
         common_tokens=len(common),
         mexc_interval_missing=missing_mexc,
-        interval_mismatches=len(mismatches),
+        interval_mismatches=raw_interval_mismatches,
+        filtered_low_funding=filtered_low_funding,
         alert_candidates=len(mismatches),
         alerts_sent=0,
         skipped_by_cooldown=skipped_cd,
@@ -870,6 +885,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Target thread: {config.target_thread_id}\n"
         f"Check interval: {CHECK_INTERVAL_SECONDS}s / {CHECK_INTERVAL_SECONDS // 60} min\n"
         f"Alert cooldown: {ALERT_COOLDOWN_SECONDS}s / {ALERT_COOLDOWN_SECONDS // 60} min\n"
+        f"Min funding filter: {MIN_FUNDING_RATE * Decimal('100'):.4f}%\n"
         f"MEXC interval cache fallback: {USE_CACHE_FALLBACK}\n"
         f"MEXC interval cache size: {len(config.mexc_interval_cache)}\n"
         f"MEXC batch: {MEXC_RATE_LIMIT_BATCH}, sleep: {MEXC_RATE_LIMIT_SLEEP}s\n"
@@ -882,7 +898,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"MEXC tokens: {last.mexc_tokens}\n"
         f"Common tokens: {last.common_tokens}\n"
         f"MEXC interval missing: {last.mexc_interval_missing}\n"
-        f"Interval mismatches: {last.interval_mismatches}\n"
+        f"Raw interval mismatches: {last.interval_mismatches}\n"
+        f"Filtered by min funding: {last.filtered_low_funding}\n"
         f"Alert candidates: {last.alert_candidates}\n"
         f"Alerts sent: {last.alerts_sent}\n"
         f"Skipped by cooldown: {last.skipped_by_cooldown}"
@@ -896,7 +913,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("Проверяю актуальные интервалы Binance/MEXC...")
 
     try:
-        binance, mexc, common, mismatches = await scan()
+        binance, mexc, common, mismatches, raw_interval_mismatches, filtered_low_funding = await scan()
     except Exception as exc:
         logger.exception("Manual check failed")
         config.last_scan = ScanStats(
@@ -917,7 +934,8 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         mexc_tokens=len(mexc),
         common_tokens=len(common),
         mexc_interval_missing=missing_mexc,
-        interval_mismatches=len(mismatches),
+        interval_mismatches=raw_interval_mismatches,
+        filtered_low_funding=filtered_low_funding,
         alert_candidates=len(mismatches),
         alerts_sent=0,
         skipped_by_cooldown=skipped_cd,
@@ -930,7 +948,9 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"MEXC tokens: {len(mexc)}",
         f"Common tokens: {len(common)}",
         f"MEXC interval missing: {missing_mexc}",
-        f"Interval mismatches: {len(mismatches)}",
+        f"Raw interval mismatches: {raw_interval_mismatches}",
+        f"Filtered by min funding: {filtered_low_funding}",
+        f"Alert candidates: {len(mismatches)}",
         f"Would send now: {len(to_send)}",
         "",
     ]
