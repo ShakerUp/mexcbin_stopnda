@@ -1,0 +1,22 @@
+# Секреты и конфигурации
+.env
+config.json
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Python кеш и скомпилированные файлы
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Логи
+*.log
+
+# Системные файлы
+.DS_Store
+.vscode/
+.idea/
