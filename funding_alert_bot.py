@@ -1,5 +1,3 @@
-from pathlib import Path
-
 import asyncio
 import html
 import json
@@ -40,11 +38,15 @@ CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "config.json"))
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "900"))
 
 # Cooldown отдельно для каждого тикера
-ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "21600"))  # 6h
+ALERT_COOLDOWN_SECONDS = int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600"))  # 1h
 
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20"))
 
 QUOTE = os.getenv("QUOTE", "USDT").upper()
+
+# Minimum absolute funding rate on at least one exchange to consider alert.
+# Example: 0.001 = 0.1%
+MIN_FUNDING_RATE = Decimal(os.getenv("MIN_FUNDING_RATE", "0.001"))
 
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com").rstrip("/")
 MEXC_BASE_URL = os.getenv("MEXC_BASE_URL", "https://api.mexc.com").rstrip("/")
@@ -81,6 +83,20 @@ class IntervalCacheItem:
 
 
 @dataclass
+class ScanStats:
+    last_check_at: float | None = None
+    binance_tokens: int = 0
+    mexc_tokens: int = 0
+    common_tokens: int = 0
+    mexc_interval_missing: int = 0
+    interval_mismatches: int = 0
+    alert_candidates: int = 0
+    alerts_sent: int = 0
+    skipped_by_cooldown: int = 0
+    error: str | None = None
+
+
+@dataclass
 class BotConfig:
     target_chat_id: int | None = None
     target_thread_id: int | None = None
@@ -91,6 +107,9 @@ class BotConfig:
 
     # MEXC fallback cache: normalized symbol -> interval
     mexc_interval_cache: dict[str, IntervalCacheItem] = field(default_factory=dict)
+
+    # last scan stats for /status
+    last_scan: ScanStats = field(default_factory=ScanStats)
 
 
 def load_config() -> BotConfig:
@@ -114,6 +133,8 @@ def load_config() -> BotConfig:
         except Exception:
             continue
 
+    last_raw = raw.get("last_scan", {}) if isinstance(raw.get("last_scan", {}), dict) else {}
+
     return BotConfig(
         target_chat_id=raw.get("target_chat_id"),
         target_thread_id=raw.get("target_thread_id"),
@@ -123,6 +144,18 @@ def load_config() -> BotConfig:
             for k, v in raw.get("alert_cooldowns", {}).items()
         },
         mexc_interval_cache=cache,
+        last_scan=ScanStats(
+            last_check_at=last_raw.get("last_check_at"),
+            binance_tokens=int(last_raw.get("binance_tokens", 0)),
+            mexc_tokens=int(last_raw.get("mexc_tokens", 0)),
+            common_tokens=int(last_raw.get("common_tokens", 0)),
+            mexc_interval_missing=int(last_raw.get("mexc_interval_missing", 0)),
+            interval_mismatches=int(last_raw.get("interval_mismatches", 0)),
+            alert_candidates=int(last_raw.get("alert_candidates", 0)),
+            alerts_sent=int(last_raw.get("alerts_sent", 0)),
+            skipped_by_cooldown=int(last_raw.get("skipped_by_cooldown", 0)),
+            error=last_raw.get("error"),
+        ),
     )
 
 
@@ -141,6 +174,18 @@ def save_config() -> None:
                 "updated_at": item.updated_at,
             }
             for symbol, item in sorted(config.mexc_interval_cache.items())
+        },
+        "last_scan": {
+            "last_check_at": config.last_scan.last_check_at,
+            "binance_tokens": config.last_scan.binance_tokens,
+            "mexc_tokens": config.last_scan.mexc_tokens,
+            "common_tokens": config.last_scan.common_tokens,
+            "mexc_interval_missing": config.last_scan.mexc_interval_missing,
+            "interval_mismatches": config.last_scan.interval_mismatches,
+            "alert_candidates": config.last_scan.alert_candidates,
+            "alerts_sent": config.last_scan.alerts_sent,
+            "skipped_by_cooldown": config.last_scan.skipped_by_cooldown,
+            "error": config.last_scan.error,
         },
     }
 
@@ -251,6 +296,12 @@ def fmt_rate(rate: Decimal | None) -> str:
 
 def fmt_interval(hours: int | None) -> str:
     return "unknown" if hours is None else f"{hours}h"
+
+
+def fmt_local_time(timestamp: float | None) -> str:
+    if not timestamp:
+        return "never"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
 
 
 def esc(value: Any) -> str:
@@ -625,6 +676,14 @@ async def scan() -> tuple[
         if b.interval_hours is None:
             continue
 
+        # Skip dead/near-zero funding pairs.
+        # At least one side must have abs funding >= MIN_FUNDING_RATE.
+        b_abs = abs(b.rate) if b.rate is not None else Decimal("0")
+        m_abs = abs(m.rate) if m.rate is not None else Decimal("0")
+
+        if max(b_abs, m_abs) < MIN_FUNDING_RATE:
+            continue
+
         if b.interval_hours != m.interval_hours:
             mismatches.append(IntervalMismatch(symbol=symbol, binance=b, mexc=m))
 
@@ -702,9 +761,14 @@ async def send_alert(context: ContextTypes.DEFAULT_TYPE, item: IntervalMismatch)
 
 async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        _binance, _mexc, _common, mismatches = await scan()
+        binance, mexc, common, mismatches = await scan()
     except Exception as exc:
         logger.exception("Check failed: %s", exc)
+        config.last_scan = ScanStats(
+            last_check_at=time.time(),
+            error=str(exc),
+        )
+        save_config()
         return
 
     active_symbols = {x.symbol for x in mismatches}
@@ -719,6 +783,21 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         to_send.append(item)
+
+    missing_mexc = sum(1 for s in common if mexc[s].interval_hours is None)
+
+    config.last_scan = ScanStats(
+        last_check_at=time.time(),
+        binance_tokens=len(binance),
+        mexc_tokens=len(mexc),
+        common_tokens=len(common),
+        mexc_interval_missing=missing_mexc,
+        interval_mismatches=len(mismatches),
+        alert_candidates=len(mismatches),
+        alerts_sent=0,
+        skipped_by_cooldown=skipped_cd,
+        error=None,
+    )
 
     logger.info(
         "SEND PLAN | candidates=%s | to_send=%s | skipped_by_cooldown=%s | target=%s thread=%s",
@@ -737,6 +816,7 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         config.alert_cooldowns[item.symbol] = time.time()
+        config.last_scan.alerts_sent += 1
         logger.info("ALERT SENT | %s", item.symbol)
 
     save_config()
@@ -783,17 +863,29 @@ async def bind_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    last = config.last_scan
+
     await update.message.reply_text(
         f"Target chat: {config.target_chat_id}\n"
         f"Target thread: {config.target_thread_id}\n"
-        f"Check interval: {CHECK_INTERVAL_SECONDS}s\n"
-        f"Alert cooldown: {ALERT_COOLDOWN_SECONDS}s\n"
+        f"Check interval: {CHECK_INTERVAL_SECONDS}s / {CHECK_INTERVAL_SECONDS // 60} min\n"
+        f"Alert cooldown: {ALERT_COOLDOWN_SECONDS}s / {ALERT_COOLDOWN_SECONDS // 60} min\n"
         f"MEXC interval cache fallback: {USE_CACHE_FALLBACK}\n"
         f"MEXC interval cache size: {len(config.mexc_interval_cache)}\n"
         f"MEXC batch: {MEXC_RATE_LIMIT_BATCH}, sleep: {MEXC_RATE_LIMIT_SLEEP}s\n"
         f"Blacklist: {len(config.blacklist)} тикеров\n"
         f"Cooldown active: {len(config.alert_cooldowns)} тикеров\n"
-        f"Log intervals: {LOG_INTERVALS}"
+        f"Log intervals: {LOG_INTERVALS}\n\n"
+        f"Last check: {fmt_local_time(last.last_check_at)}\n"
+        f"Last error: {last.error or 'none'}\n"
+        f"Binance tokens: {last.binance_tokens}\n"
+        f"MEXC tokens: {last.mexc_tokens}\n"
+        f"Common tokens: {last.common_tokens}\n"
+        f"MEXC interval missing: {last.mexc_interval_missing}\n"
+        f"Interval mismatches: {last.interval_mismatches}\n"
+        f"Alert candidates: {last.alert_candidates}\n"
+        f"Alerts sent: {last.alerts_sent}\n"
+        f"Skipped by cooldown: {last.skipped_by_cooldown}"
     )
 
 
@@ -807,11 +899,31 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         binance, mexc, common, mismatches = await scan()
     except Exception as exc:
         logger.exception("Manual check failed")
+        config.last_scan = ScanStats(
+            last_check_at=time.time(),
+            error=str(exc),
+        )
+        save_config()
         await msg.edit_text(f"❌ Ошибка проверки:\n{exc}")
         return
 
     to_send = [x for x in mismatches if cooldown_left(x.symbol) == 0]
+    skipped_cd = len(mismatches) - len(to_send)
     missing_mexc = sum(1 for s in common if mexc[s].interval_hours is None)
+
+    config.last_scan = ScanStats(
+        last_check_at=time.time(),
+        binance_tokens=len(binance),
+        mexc_tokens=len(mexc),
+        common_tokens=len(common),
+        mexc_interval_missing=missing_mexc,
+        interval_mismatches=len(mismatches),
+        alert_candidates=len(mismatches),
+        alerts_sent=0,
+        skipped_by_cooldown=skipped_cd,
+        error=None,
+    )
+    save_config()
 
     lines = [
         f"Binance tokens: {len(binance)}",
@@ -908,9 +1020,10 @@ def main() -> None:
     app = build_app()
 
     logger.info(
-        "Bot started | check_interval=%ss | alert_cooldown=%ss | quote=%s | mexc_base=%s | batch=%s | sleep=%ss | cache_fallback=%s | log_intervals=%s",
+        "Bot started | check_interval=%ss | alert_cooldown=%ss | min_funding=%s%% | quote=%s | mexc_base=%s | batch=%s | sleep=%ss | cache_fallback=%s | log_intervals=%s",
         CHECK_INTERVAL_SECONDS,
         ALERT_COOLDOWN_SECONDS,
+        f"{MIN_FUNDING_RATE * Decimal('100')}",
         QUOTE,
         MEXC_BASE_URL,
         MEXC_RATE_LIMIT_BATCH,
@@ -924,4 +1037,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
