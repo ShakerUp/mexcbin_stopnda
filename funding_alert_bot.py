@@ -49,6 +49,10 @@ QUOTE = os.getenv("QUOTE", "USDT").upper()
 # Example: 0.001 = 0.1%
 MIN_FUNDING_RATE = Decimal(os.getenv("MIN_FUNDING_RATE", "0.001"))
 
+# Also alert when funding rates differ by at least this amount, even if intervals are equal.
+# Example: 0.0015 = 0.15%
+FUNDING_DIFF_THRESHOLD = Decimal(os.getenv("FUNDING_DIFF_THRESHOLD", "0.0015"))
+
 # Alias matching:
 # - MEXC stock futures usually have STOCK suffix: NVDASTOCKUSDT -> NVDAUSDT
 # - Oil/commodity tickers can have different names: Binance BZ/CL vs MEXC UKOIL/USOIL
@@ -225,6 +229,13 @@ class IntervalMismatch:
     symbol: str
     binance: FundingInfo
     mexc: FundingInfo
+    signal_type: str = "interval_mismatch"  # interval_mismatch / funding_diff
+    funding_diff_rate: Decimal = Decimal("0")
+    note: str = ""
+
+    @property
+    def cooldown_key(self) -> str:
+        return f"{self.symbol}:{self.signal_type}"
 
 
 # ============================================================
@@ -870,23 +881,52 @@ async def scan() -> tuple[
         if b.interval_hours is None:
             continue
 
+        b_rate = b.rate if b.rate is not None else Decimal("0")
+        m_rate = m.rate if m.rate is not None else Decimal("0")
+        funding_diff = abs(b_rate - m_rate)
+
         if b.interval_hours != m.interval_hours:
             raw_interval_mismatches += 1
 
-            # Skip dead/near-zero funding pairs.
-            # At least one side must have abs funding >= MIN_FUNDING_RATE.
-            b_abs = abs(b.rate) if b.rate is not None else Decimal("0")
-            m_abs = abs(m.rate) if m.rate is not None else Decimal("0")
+            # Skip dead/near-zero funding interval alerts.
+            # At least one side must have abs funding >= MIN_FUNDING_RATE,
+            # unless funding difference itself is large enough.
+            b_abs = abs(b_rate)
+            m_abs = abs(m_rate)
             max_funding = max(b_abs, m_abs)
 
-            if max_funding < MIN_FUNDING_RATE:
+            if max_funding < MIN_FUNDING_RATE and funding_diff < FUNDING_DIFF_THRESHOLD:
                 filtered_low_funding += 1
                 continue
 
-            mismatches.append(IntervalMismatch(symbol=symbol, binance=b, mexc=m))
+            mismatches.append(
+                IntervalMismatch(
+                    symbol=symbol,
+                    binance=b,
+                    mexc=m,
+                    signal_type="interval_mismatch",
+                    funding_diff_rate=funding_diff,
+                    note="different intervals",
+                )
+            )
+            continue
+
+        # New signal:
+        # intervals are the same, but funding rates differ strongly enough.
+        if funding_diff >= FUNDING_DIFF_THRESHOLD:
+            mismatches.append(
+                IntervalMismatch(
+                    symbol=symbol,
+                    binance=b,
+                    mexc=m,
+                    signal_type="funding_diff",
+                    funding_diff_rate=funding_diff,
+                    note="same intervals, funding spread",
+                )
+            )
 
     logger.info(
-        "SCAN | Binance tokens=%s | MEXC tokens=%s | common=%s | raw mismatches=%s | filtered low funding=%s | alert candidates=%s | MEXC interval missing=%s | blacklist=%s | min funding=%s%%",
+        "SCAN | Binance tokens=%s | MEXC tokens=%s | common=%s | raw interval mismatches=%s | filtered low funding=%s | alert candidates=%s | MEXC interval missing=%s | blacklist=%s | min funding=%s%% | funding diff threshold=%s%%",
         len(binance),
         len(mexc),
         len(common),
@@ -896,6 +936,7 @@ async def scan() -> tuple[
         missing_mexc_intervals,
         len(config.blacklist),
         f"{MIN_FUNDING_RATE * Decimal('100'):.4f}",
+        f"{FUNDING_DIFF_THRESHOLD * Decimal('100'):.4f}",
     )
 
     if common:
@@ -925,7 +966,7 @@ async def scan() -> tuple[
         logger.info(
             "ALERT CANDIDATES | %s",
             ", ".join(
-                f"{x.symbol}(B={fmt_interval(x.binance.interval_hours)},M={fmt_interval(x.mexc.interval_hours)},src={x.mexc.interval_source})"
+                f"{x.symbol}(type={x.signal_type},B={fmt_interval(x.binance.interval_hours)},M={fmt_interval(x.mexc.interval_hours)},diff={fmt_rate(x.funding_diff_rate)},src={x.mexc.interval_source})"
                 for x in mismatches[:80]
             ),
         )
@@ -934,13 +975,29 @@ async def scan() -> tuple[
 
 
 def render_alert(item: IntervalMismatch) -> str:
+    if item.signal_type == "funding_diff":
+        title = "⚠️ <b>Funding difference alert</b>"
+        reason = (
+            f"Funding diff: <b>{fmt_rate(item.funding_diff_rate)}</b> "
+            f"(limit {fmt_rate(FUNDING_DIFF_THRESHOLD)})"
+        )
+    else:
+        title = "🚨 <b>Разный funding interval</b>"
+        reason = (
+            f"Funding diff: <b>{fmt_rate(item.funding_diff_rate)}</b>\n"
+            f"Interval alert min funding filter: {fmt_rate(MIN_FUNDING_RATE)}"
+        )
+
     return (
-        "🚨 <b>Разный funding interval</b>\n\n"
-        f"<b>{esc(item.symbol)}</b>\n\n"
+        f"{title}\n\n"
+        f"<b>{esc(item.symbol)}</b>\n"
+        f"Signal: <code>{esc(item.signal_type)}</code>\n"
+        f"{reason}\n\n"
         f"Binance: <b>{fmt_interval(item.binance.interval_hours)}</b> "
         f"({esc(item.binance.interval_source)}) | funding {fmt_rate(item.binance.rate)}\n"
         f"MEXC: <b>{fmt_interval(item.mexc.interval_hours)}</b> "
         f"({esc(item.mexc.interval_source)}) | funding {fmt_rate(item.mexc.rate)}\n\n"
+        f"Binance symbol: <code>{esc(item.binance.exchange_symbol)}</code>\n"
         f"MEXC symbol: <code>{esc(item.mexc.exchange_symbol)}</code>\n"
         f"Blacklist: <code>/bladd {esc(item.symbol)}</code>"
     )
@@ -972,14 +1029,14 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         save_config()
         return
 
-    active_symbols = {x.symbol for x in mismatches}
+    active_symbols = {x.cooldown_key for x in mismatches}
     cleanup_old_cooldowns(active_symbols)
 
     to_send: list[IntervalMismatch] = []
     skipped_cd = 0
 
     for item in mismatches:
-        if cooldown_left(item.symbol) > 0:
+        if cooldown_left(item.cooldown_key) > 0:
             skipped_cd += 1
             continue
 
@@ -1017,9 +1074,9 @@ async def monitor_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Failed to send alert for %s", item.symbol)
             continue
 
-        config.alert_cooldowns[item.symbol] = time.time()
+        config.alert_cooldowns[item.cooldown_key] = time.time()
         config.last_scan.alerts_sent += 1
-        logger.info("ALERT SENT | %s", item.symbol)
+        logger.info("ALERT SENT | %s | type=%s", item.symbol, item.signal_type)
 
     save_config()
 
@@ -1308,6 +1365,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Check interval: {CHECK_INTERVAL_SECONDS}s / {CHECK_INTERVAL_SECONDS // 60} min\n"
         f"Alert cooldown: {ALERT_COOLDOWN_SECONDS}s / {ALERT_COOLDOWN_SECONDS // 60} min\n"
         f"Min funding filter: {MIN_FUNDING_RATE * Decimal('100'):.4f}%\n"
+        f"Funding diff alert threshold: {FUNDING_DIFF_THRESHOLD * Decimal('100'):.4f}%\n"
         f"Stock aliases: {ENABLE_STOCK_ALIASES}\n"
         f"1000 aliases: {ENABLE_1000_ALIASES}\n"
         f"Manual aliases: {len(TICKER_ALIASES)}\n"
@@ -1350,7 +1408,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.edit_text(f"❌ Ошибка проверки:\n{exc}")
         return
 
-    to_send = [x for x in mismatches if cooldown_left(x.symbol) == 0]
+    to_send = [x for x in mismatches if cooldown_left(x.cooldown_key) == 0]
     skipped_cd = len(mismatches) - len(to_send)
     missing_mexc = sum(1 for s in common if mexc[s].interval_hours is None)
 
@@ -1384,8 +1442,8 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if mismatches:
         lines.append("Mismatches:")
         lines.extend(
-            f"{x.symbol}: Binance {fmt_interval(x.binance.interval_hours)} / "
-            f"MEXC {fmt_interval(x.mexc.interval_hours)} ({x.mexc.interval_source})"
+            f"{x.symbol}: {x.signal_type} | Binance {fmt_interval(x.binance.interval_hours)} / "
+            f"MEXC {fmt_interval(x.mexc.interval_hours)} | diff {fmt_rate(x.funding_diff_rate)} ({x.mexc.interval_source})"
             for x in mismatches[:30]
         )
 
@@ -1406,6 +1464,8 @@ async def bladd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     symbol = normalize_symbol(context.args[0])
     config.blacklist.add(symbol)
     config.alert_cooldowns.pop(symbol, None)
+    config.alert_cooldowns.pop(f"{symbol}:interval_mismatch", None)
+    config.alert_cooldowns.pop(f"{symbol}:funding_diff", None)
     save_config()
 
     await update.message.reply_text(f"✅ {symbol} добавлен в blacklist")
@@ -1467,10 +1527,11 @@ def main() -> None:
     app = build_app()
 
     logger.info(
-        "Bot started | check_interval=%ss | alert_cooldown=%ss | min_funding=%s%% | quote=%s | mexc_base=%s | batch=%s | sleep=%ss | cache_fallback=%s | stock_aliases=%s | 1000_aliases=%s | manual_aliases=%s | log_intervals=%s",
+        "Bot started | check_interval=%ss | alert_cooldown=%ss | min_funding=%s%% | funding_diff_threshold=%s%% | quote=%s | mexc_base=%s | batch=%s | sleep=%ss | cache_fallback=%s | stock_aliases=%s | 1000_aliases=%s | manual_aliases=%s | log_intervals=%s",
         CHECK_INTERVAL_SECONDS,
         ALERT_COOLDOWN_SECONDS,
         f"{MIN_FUNDING_RATE * Decimal('100')}",
+        f"{FUNDING_DIFF_THRESHOLD * Decimal('100')}",
         QUOTE,
         MEXC_BASE_URL,
         MEXC_RATE_LIMIT_BATCH,
